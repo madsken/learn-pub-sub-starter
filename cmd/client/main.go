@@ -3,8 +3,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"os"
-	"os/signal"
 
 	"github.com/bootdotdev/learn-pub-sub-starter/internal/gamelogic"
 	"github.com/bootdotdev/learn-pub-sub-starter/internal/pubsub"
@@ -27,23 +25,102 @@ func main() {
 		log.Fatalf("Error creating client: %s", err)
 	}
 
-	pubsub.DeclareAndBind(
+	amqpChan, amqpQueue, err := pubsub.DeclareAndBind(
 		amqpConnection,
-		"peril_direct",
+		routing.ExchangePerilDirect,
 		fmt.Sprintf("%s.%s", routing.PauseKey, userName),
 		routing.PauseKey,
 		pubsub.Transient,
 	)
+	if err != nil {
+		log.Fatalf("error subscribing: %s", err)
+	}
+	fmt.Printf("successfully bound to: %s\n", amqpQueue.Name)
 
-	fmt.Println("Peril client started successfully...")
+	gameState := gamelogic.NewGameState(userName)
+	err = createSubscribers(gameState, amqpConnection, amqpChan)
+	if err != nil {
+		log.Fatalf("could not create subscriptions: %s", err)
+	}
 
-	waitForSigint()
+	for {
+		commands := gamelogic.GetInput()
+		if len(commands) == 0 {
+			continue
+		}
 
-	fmt.Println("Closing client...")
+		switch commands[0] {
+		case "spawn":
+			err = gameState.CommandSpawn(commands)
+			if err != nil {
+				fmt.Printf("invalid subcommand: %v\n", err)
+				continue
+			}
+		case "move":
+			move, err := gameState.CommandMove(commands)
+			if err != nil {
+				fmt.Printf("invalid subcommand: %v\n", err)
+				continue
+			}
+
+			err = pubsub.PublishJSON(amqpChan, routing.ExchangePerilTopic, routing.ArmyMovesPrefix+"."+gameState.GetUsername(), move)
+			if err != nil {
+				fmt.Printf("could not publish move: %s\n", err)
+				continue
+			}
+			fmt.Println("Move published to players")
+
+		case "status":
+			gameState.CommandStatus()
+		case "help":
+			gamelogic.PrintClientHelp()
+		case "spam":
+			fmt.Println("No spamming allowed")
+		case "quit":
+			gamelogic.PrintQuit()
+			return
+		default:
+			fmt.Println("Invalid command")
+		}
+	}
 }
 
-func waitForSigint() {
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt)
-	<-signalChan
+func createSubscribers(gs *gamelogic.GameState, conn *amqp.Connection, amqpChan *amqp.Channel) error {
+	err := pubsub.SubscribeJSON(
+		conn,
+		routing.ExchangePerilDirect,
+		routing.PauseKey+"."+gs.GetUsername(),
+		routing.PauseKey,
+		pubsub.Transient,
+		handlerPause(gs),
+	)
+	if err != nil {
+		return err
+	}
+
+	err = pubsub.SubscribeJSON(
+		conn,
+		string(routing.ExchangePerilTopic),
+		string(routing.ArmyMovesPrefix)+"."+gs.GetUsername(),
+		string(routing.ArmyMovesPrefix)+".*",
+		pubsub.Transient,
+		handlerMove(gs, amqpChan),
+	)
+	if err != nil {
+		return err
+	}
+
+	err = pubsub.SubscribeJSON(
+		conn,
+		string(routing.ExchangePerilTopic),
+		string(routing.WarRecognitionsPrefix),
+		string(routing.WarRecognitionsPrefix)+".*",
+		pubsub.Durable,
+		handlerWar(gs, amqpChan),
+	)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
